@@ -1,24 +1,65 @@
-# python
-# Datei: `lib/common/object_model.py`
 from __future__ import annotations
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, date
 from typing import Optional, Any, Dict
+import threading
 import hashlib
 
 from lib.common.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Module-level counter for internal IDs and a lock for thread-safety
+_next_internal_id: int = 0
+_next_internal_id_lock = threading.Lock()
+
+
+def _get_next_internal_id() -> int:
+    global _next_internal_id
+    with _next_internal_id_lock:
+        val = _next_internal_id
+        _next_internal_id += 1
+    return val
+
+
+def _ensure_next_internal_id_at_least(min_exclusive: int) -> None:
+    """
+    Ensure the next internal id will be at least min_exclusive (i.e. next id > min_exclusive).
+    This is used when loading existing data to continue counting.
+    """
+    global _next_internal_id
+    with _next_internal_id_lock:
+        if _next_internal_id <= min_exclusive:
+            _next_internal_id = min_exclusive + 1
+
+
+def _maybe_parse_int(val: Any) -> Optional[int]:
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        try:
+            return int(val)
+        except ValueError:
+            return None
+    return None
+
 
 @dataclass
 class ObjectModel:
     """
     Simple object model for articles.
-    Fields: id, autor, category, published_date, parsed_date, html, text, ai_summary,
+    Fields: _id (internal int), id (external identifier, may be numeric string),
+    autor, category, published_date, parsed_date, html, text, ai_summary,
     titel, teaser, pos_taggs, content_hash
     """
+    # internal numeric id (auto-assigned)
+    _id: Optional[int] = None
+
+    # public id (kept for compatibility). If missing or looks like a URL it will be set to the numeric _id.
     id: Optional[str] = None
+
     titel: Optional[str] = None
     teaser: Optional[str] = None
     autor: Optional[str] = None
@@ -32,7 +73,18 @@ class ObjectModel:
     content_hash: Optional[str] = None
 
     def __post_init__(self) -> None:
-        """Log creation and ensure content_hash is computed if possible."""
+        """Assign internal _id if missing and compute content_hash if possible."""
+        # assign internal id if not provided
+        if self._id is None:
+            self._id = _get_next_internal_id()
+        else:
+            # if _id was provided on construction, ensure counter continues beyond it
+            _ensure_next_internal_id_at_least(self._id)
+
+        # If id is missing or looks like a URL, prefer a simple incremental id (string)
+        if not self.id or (isinstance(self.id, str) and self.id.startswith(("http://", "https://"))):
+            self.id = str(self._id)
+
         # compute content hash from titel and teaser when not provided
         if self.content_hash is None and self.titel:
             try:
@@ -49,7 +101,8 @@ class ObjectModel:
                 self.content_hash = None
 
         logger.info(
-            "ObjectModel created: id=%s autor=%s category=%s published_date=%s parsed_date=%s titel=%s teaser_present=%s pos_taggs_count=%d content_hash=%s",
+            "ObjectModel created: _id=%s id=%s autor=%s category=%s published_date=%s parsed_date=%s titel=%s teaser_present=%s pos_taggs_count=%d content_hash=%s",
+            self._id,
             self.id,
             self.autor,
             self.category,
@@ -67,8 +120,10 @@ def to_dict(obj) -> Dict[str, Any]:
     Robuste Serialisierung eines ObjectModel-Objekts zu einem dict.
     published_date und parsed_date werden als ISO-Strings ausgegeben
     falls sie datetime/date sind; Strings bleiben unverändert; None bleibt None.
+    Gibt auch das interne `_id` aus.
     """
     data: Dict[str, Any] = {}
+    data["_id"] = getattr(obj, "_id", None)
     data["id"] = getattr(obj, "id", None)
     data["html"] = getattr(obj, "html", None)
     data["text"] = getattr(obj, "text", None)
@@ -86,7 +141,6 @@ def to_dict(obj) -> Dict[str, Any]:
         if isinstance(val, str):
             return val
         try:
-            # Versuch: ggf. vorhandene isoformat-Methode nutzen
             iso = getattr(val, "isoformat", None)
             if callable(iso):
                 return iso()
@@ -101,7 +155,10 @@ def to_dict(obj) -> Dict[str, Any]:
 
 
 def from_dict(data: Dict[str, Any]) -> ObjectModel:
-    """Create an ObjectModel from a dict; accepts ISO strings for date fields."""
+    """Create an ObjectModel from a dict; accepts ISO strings for date fields.
+    Updates the internal id counter based on existing `_id` or numeric `id` values so
+    subsequent new objects continue counting from the maximum seen.
+    """
     logger.debug("Deserializing ObjectModel from data keys=%s", list(data.keys()))
 
     def _parse_date(value: Any, field_name: str) -> Optional[datetime]:
@@ -123,6 +180,18 @@ def from_dict(data: Dict[str, Any]) -> ObjectModel:
     pd = _parse_date(data.get("published_date"), "published_date")
     parsed = _parse_date(data.get("parsed_date"), "parsed_date")
 
+    # Update internal id counter from existing data so it continues incrementing across runs
+    existing_internal = _maybe_parse_int(data.get("_id"))
+    existing_id_numeric = _maybe_parse_int(data.get("id"))
+    max_seen = None
+    if existing_internal is not None:
+        max_seen = existing_internal
+    if existing_id_numeric is not None:
+        if max_seen is None or existing_id_numeric > max_seen:
+            max_seen = existing_id_numeric
+    if max_seen is not None:
+        _ensure_next_internal_id_at_least(max_seen)
+
     pos_taggs_val = data.get("pos_taggs", {})
     if pos_taggs_val is None:
         pos_taggs_val = {}
@@ -131,6 +200,7 @@ def from_dict(data: Dict[str, Any]) -> ObjectModel:
         pos_taggs_val = {}
 
     obj = ObjectModel(
+        _id=existing_internal,
         id=data.get("id"),
         autor=data.get("autor"),
         category=data.get("category"),
@@ -145,5 +215,5 @@ def from_dict(data: Dict[str, Any]) -> ObjectModel:
         content_hash=data.get("content_hash"),
     )
 
-    logger.debug("Deserialized ObjectModel id=%s autor=%s category=%s", obj.id, obj.autor, obj.category)
+    logger.debug("Deserialized ObjectModel _id=%s id=%s autor=%s category=%s", obj._id, obj.id, obj.autor, obj.category)
     return obj
