@@ -1,129 +1,182 @@
 # python
 from __future__ import annotations
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Iterable, List, Dict, Optional, Any
-from urllib.parse import urlsplit, unquote
 import os
-import re
+import hashlib
+import logging
 import threading
+from typing import List, Dict, Any, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
+import tempfile
+from urllib.parse import urlparse, unquote
 import requests
-from requests import Session
-from lib.common.logging import get_logger
 from tqdm import tqdm
+
+from lib.common.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Erlaube direkte Download-Extensions (ersetze/erweitere bei Bedarf)
-_ALLOWED_EXTENSIONS = {".pdf", ".zip", ".jpg", ".jpeg", ".png"}
+# Lock used to protect mutation of known_hashes when provided
+_known_hashes_lock = threading.Lock()
 
 
-def _sanitize_filename(name: str) -> str:
-    name = unquote(name)
-    # entferne unsichere Zeichen
-    name = re.sub(r"[^\w\-\._() ]+", "_", name)
-    return name[:200]
+def _sha256_hex(s: str) -> str:
+    h = hashlib.sha256()
+    h.update(s.encode("utf-8"))
+    return h.hexdigest()
 
 
-def _choose_filename_from_response(url: str, resp: Optional[requests.Response]) -> str:
-    # 1) Content-Disposition
-    if resp is not None:
-        cd = resp.headers.get("content-disposition", "")
-        m = re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';]+)', cd, flags=re.IGNORECASE)
-        if m:
-            return _sanitize_filename(m.group(1))
-
-    # 2) from URL path
-    path = urlsplit(url).path or ""
-    base = os.path.basename(path)
-    if base:
-        return _sanitize_filename(base)
-
-    # 3) fallback
-    return _sanitize_filename("downloaded_file")
+def _compute_file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-_filename_lock = threading.Lock()
-
-
-def _ensure_unique_path(dest_dir: str, name: str) -> str:
-    os.makedirs(dest_dir, exist_ok=True)
-    base, ext = os.path.splitext(name)
-    attempt = 0
-    with _filename_lock:
-        candidate = name
-        while os.path.exists(os.path.join(dest_dir, candidate)):
-            attempt += 1
-            candidate = f"{base}_{attempt}{ext}"
-        return os.path.join(dest_dir, candidate)
-
-
-def _default_filter(url: str) -> bool:
+def _safe_filename_from_url(url: str, url_hash: str) -> str:
     """
-    Gibt True zurück, wenn die URL heruntergeladen werden soll.
-    Verwirft direkte Dateien mit Extensions aus `_ALLOWED_EXTENSIONS`.
+    Erzeuge einen stabilen, kurzen Dateinamen basierend auf der URL und deren Hash.
+    Bevorzugt wird der letzte Pfadbestandteil der URL; falls leer/ungültig, wird der Hash verwendet.
     """
-    path = urlsplit(url).path or ""
-    ext = os.path.splitext(path)[1].lower()
-    if ext and ext in _ALLOWED_EXTENSIONS:
-        return True  # erlauben, falls diese Extensions gewünscht sind
-    # keine Extension -> wahrscheinlich eine HTML-Seite -> erlauben
-    return True
-
-
-def _download_worker(session: Session, url: str, dest_dir: str, timeout: int = 30) -> Dict[str, Any]:
     try:
-        resp = session.get(url, stream=True, timeout=timeout)
+        p = urlparse(url)
+        name = os.path.basename(unquote(p.path)) or ""
+        name = name.strip()
+        # remove query fragments etc. and unsafe chars
+        if name:
+            # limit length and replace spaces
+            name = name.split("?")[0].split("#")[0]
+            # sanitize
+            name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
+            if 1 <= len(name) <= 200:
+                return f"_{url_hash[:12]}_{name}"
+    except Exception:
+        pass
+    return f"_{url_hash}"
+
+
+def _ensure_dir(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        logger.exception("Failed to create directory %s", path)
+
+
+def _download_single(url: str, dest_dir: str, timeout: int = 30, known_hashes: Optional[Set[str]] = None) -> Dict[str, Any]:
+    """
+    Lädt eine URL herunter und speichert sie in dest_dir.
+    - Wenn known_hashes übergeben und der URL-Hash bereits vorhanden ist, wird übersprungen.
+    - Fügt neue URL-/Content-Hashes thread-sicher zu known_hashes hinzu (falls gesetzt).
+    Rückgabe: dict mit keys: url, success(bool), path(optional), url_hash, content_hash(optional), error(optional), skipped(bool)
+    """
+    result: Dict[str, Any] = {"url": url, "success": False, "path": None, "url_hash": None, "content_hash": None, "error": None, "skipped": False}
+    url_hash = None
+    try:
+        url_hash = _sha256_hex(url)
+        result["url_hash"] = url_hash
+
+        # if caller provided known_hashes, check early by url_hash
+        if known_hashes is not None:
+            with _known_hashes_lock:
+                if url_hash in known_hashes:
+                    result["skipped"] = True
+                    result["success"] = True
+                    logger.debug("Skipping download for known URL hash %s: %s", url_hash, url)
+                    return result
+
+        # stream download to temp file
+        resp = requests.get(url, stream=True, timeout=timeout)
         resp.raise_for_status()
 
-        filename = _choose_filename_from_response(url, resp)
-        out_path = _ensure_unique_path(dest_dir, filename)
-
-        with open(out_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-
-        return {"url": url, "success": True, "path": out_path, "status_code": resp.status_code}
-    except Exception as e:
-        logger.debug("Download failed for %s: %s", url, e)
-        return {"url": url, "success": False, "error": str(e)}
-
-
-def download_urls(urls: Iterable[str],
-                  dest_dir: str,
-                  max_workers: int = 6,
-                  show_progress: bool = False,
-                  filter_fn: Optional[Callable[[str], bool]] = None,
-                  session: Optional[Session] = None) -> List[Dict[str, Any]]:
-    """
-    Lädt die gegebenen URLs parallel in dest_dir herunter.
-    - filter_fn(url) -> bool kann genutzt werden, um URLs zu überspringen.
-    - Gibt eine Liste von Ergebnis-Dictionaries zurück.
-    """
-    filter_fn = filter_fn or _default_filter
-    urls = [u for u in urls if u and filter_fn(u)]
-    if not urls:
-        return []
-
-    sess_provided = session is not None
-    session = session or requests.Session()
-
-    results: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as exe:
-        futures = {exe.submit(_download_worker, session, u, dest_dir): u for u in urls}
-        progress = tqdm(total=len(futures), desc="downloads", unit="file") if show_progress else None
-        for fut in as_completed(futures):
-            res = fut.result()
-            results.append(res)
-            if progress:
-                progress.update(1)
-        if progress:
-            progress.close()
-
-    if not sess_provided:
+        _ensure_dir(dest_dir)
+        # write to temp file first
+        fd, tmp_path = tempfile.mkstemp(prefix="dl_", dir=dest_dir)
+        os.close(fd)
         try:
-            session.close()
-        except Exception:
-            logger.debug("Session close failed")
+            with open(tmp_path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        fh.write(chunk)
+
+            # compute content hash of the downloaded file
+            content_hash = _compute_file_sha256(tmp_path)
+            result["content_hash"] = content_hash
+
+            # decide final filename
+            fname = _safe_filename_from_url(url, url_hash)
+            final_path = os.path.join(dest_dir, fname)
+            # avoid overwriting by appending short content hash if collision
+            if os.path.exists(final_path):
+                existing_hash = _compute_file_sha256(final_path)
+                if existing_hash != content_hash:
+                    final_path = f"{final_path}_{content_hash[:12]}"
+
+            # move temp file to final location
+            shutil.move(tmp_path, final_path)
+            result["path"] = final_path
+            result["success"] = True
+
+            # update known_hashes with url_hash and content_hash if provided
+            if known_hashes is not None:
+                with _known_hashes_lock:
+                    known_hashes.add(url_hash)
+                    if result["content_hash"]:
+                        known_hashes.add(result["content_hash"])
+
+            logger.info("Downloaded %s -> %s (url_hash=%s)", url, final_path, url_hash)
+            return result
+        finally:
+            # cleanup temp if still present
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+    except requests.RequestException as e:
+        logger.debug("Request error downloading %s: %s", url, e)
+        result["error"] = str(e)
+    except Exception as e:
+        logger.exception("Unexpected error downloading %s", url)
+        result["error"] = str(e)
+
+    return result
+
+
+def download_urls(urls: List[str], dest_dir: str, max_workers: int = 6, show_progress: bool = True, known_hashes: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
+    """
+    Paralleler Download von URLs in das Verzeichnis dest_dir.
+    - known_hashes: optionales Set\[str\] (url- oder content-hashes), das genutzt wird, um bereits bekannte Inhalte/URLs zu überspringen; das Set wird bei neuen Downloads aktualisiert (thread-sicher).
+    - Rückgabe: Liste von Ergebnis-Dicts (Reihenfolge nicht garantiert).
+    """
+    results: List[Dict[str, Any]] = []
+    if not urls:
+        return results
+
+    _ensure_dir(dest_dir)
+
+    # use ThreadPoolExecutor for IO-bound downloads
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as exe:
+        futures = {exe.submit(_download_single, url, dest_dir, 30, known_hashes): url for url in urls}
+        if show_progress:
+            pbar = tqdm(total=len(futures), desc="downloads", unit="file")
+        else:
+            pbar = None
+
+        try:
+            for fut in as_completed(futures):
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    # should not happen often since _download_single catches exceptions, but be defensive
+                    logger.exception("Download future raised unexpected exception")
+                    res = {"url": futures.get(fut), "success": False, "error": str(e)}
+                results.append(res)
+                if pbar:
+                    pbar.update(1)
+        finally:
+            if pbar:
+                pbar.close()
 
     return results

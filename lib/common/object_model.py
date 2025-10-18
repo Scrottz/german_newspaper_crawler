@@ -1,3 +1,4 @@
+# python
 from __future__ import annotations
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, date
@@ -46,19 +47,23 @@ def _maybe_parse_int(val: Any) -> Optional[int]:
     return None
 
 
-@dataclass
+@dataclass(init=False)
 class ObjectModel:
     """
     Simple object model for articles.
-    Fields: _id (internal int), id (external identifier, may be numeric string),
-    autor, category, published_date, parsed_date, html, text, ai_summary,
-    titel, teaser, pos_taggs, content_hash
+
+    Backwards-compatible constructor:
+    - accepts `_id` and `url` as explicit kwargs
+    - also accepts legacy `id` kwarg:
+        * numeric -> treated as internal `_id`
+        * string starting with http(s) -> treated as `url`
+        * other string -> treated as `url` (fallback)
     """
     # internal numeric id (auto-assigned)
     _id: Optional[int] = None
 
-    # public id (kept for compatibility). If missing or looks like a URL it will be set to the numeric _id.
-    id: Optional[str] = None
+    # url field replaces the previous public `id` that held the URL
+    url: Optional[str] = None
 
     titel: Optional[str] = None
     teaser: Optional[str] = None
@@ -72,8 +77,63 @@ class ObjectModel:
     pos_taggs: Dict[str, str] = field(default_factory=dict)
     content_hash: Optional[str] = None
 
+    def __init__(
+        self,
+        _id: Optional[int] = None,
+        url: Optional[str] = None,
+        id: Any = None,  # backward-compatible alias: numeric -> _id, str-url -> url
+        titel: Optional[str] = None,
+        teaser: Optional[str] = None,
+        autor: Optional[str] = None,
+        category: Optional[str] = None,
+        published_date: Optional[datetime] = None,
+        parsed_date: Optional[datetime] = None,
+        html: Optional[str] = None,
+        text: Optional[str] = None,
+        ai_summary: Optional[str] = None,
+        pos_taggs: Optional[Dict[str, str]] = None,
+        content_hash: Optional[str] = None,
+    ) -> None:
+        # Resolve legacy `id` alias
+        resolved_internal_id: Optional[int] = None
+        resolved_url: Optional[str] = None
+
+        if id is not None:
+            maybe_num = _maybe_parse_int(id)
+            if maybe_num is not None:
+                resolved_internal_id = maybe_num
+            elif isinstance(id, str) and id.startswith(("http://", "https://")):
+                resolved_url = id
+            elif isinstance(id, str):
+                # fallback: preserve string as url if no other candidate
+                resolved_url = id
+
+        # explicit kwargs override alias resolution
+        if _id is not None:
+            resolved_internal_id = _id
+        if url is not None:
+            resolved_url = url
+
+        # assign resolved values
+        self._id = resolved_internal_id
+        self.url = resolved_url
+        self.titel = titel
+        self.teaser = teaser
+        self.autor = autor
+        self.category = category
+        self.published_date = published_date
+        self.parsed_date = parsed_date
+        self.html = html
+        self.text = text
+        self.ai_summary = ai_summary
+        self.pos_taggs = pos_taggs if isinstance(pos_taggs, dict) else {}
+        self.content_hash = content_hash
+
+        # finalize (assign internal id if missing, compute content_hash fallback, logging)
+        self.__post_init__()
+
     def __post_init__(self) -> None:
-        """Assign internal _id if missing and compute content_hash if possible."""
+        """Assign internal \_id if missing and compute content_hash from url when available."""
         # assign internal id if not provided
         if self._id is None:
             self._id = _get_next_internal_id()
@@ -81,29 +141,33 @@ class ObjectModel:
             # if _id was provided on construction, ensure counter continues beyond it
             _ensure_next_internal_id_at_least(self._id)
 
-        # If id is missing or looks like a URL, prefer a simple incremental id (string)
-        if not self.id or (isinstance(self.id, str) and self.id.startswith(("http://", "https://"))):
-            self.id = str(self._id)
-
-        # compute content hash from titel and teaser when not provided
-        if self.content_hash is None and self.titel:
+        # compute content_hash from the URL string (url) if available and looks like a URL
+        if self.content_hash is None and isinstance(self.url, str) and self.url.startswith(("http://", "https://")):
             try:
                 h = hashlib.sha256()
-                # use titel and teaser separated to avoid accidental collisions
-                h.update(self.titel.encode("utf-8"))
-                h.update(b"\n")
-                teaser_bytes = self.teaser.encode("utf-8") if self.teaser else b""
-                h.update(teaser_bytes)
+                h.update(self.url.encode("utf-8"))
                 self.content_hash = h.hexdigest()
-                logger.debug("Computed content_hash for titel=%s: %s", self.titel, self.content_hash)
+                logger.debug("Computed content_hash from url=%s: %s", self.url, self.content_hash)
             except Exception:
-                logger.exception("Failed to compute content_hash for titel=%s", self.titel)
+                logger.exception("Failed to compute content_hash from url=%s", self.url)
                 self.content_hash = None
+        elif self.content_hash is None:
+            # fallback: compute from text/html if available
+            data = (self.text or self.html or "").strip()
+            if data:
+                try:
+                    h = hashlib.sha256()
+                    h.update(data.encode("utf-8"))
+                    self.content_hash = h.hexdigest()
+                    logger.debug("Computed content_hash from content for _id=%s: %s", self._id, self.content_hash)
+                except Exception:
+                    logger.exception("Failed to compute fallback content_hash for _id=%s", self._id)
+                    self.content_hash = None
 
         logger.info(
-            "ObjectModel created: _id=%s id=%s autor=%s category=%s published_date=%s parsed_date=%s titel=%s teaser_present=%s pos_taggs_count=%d content_hash=%s",
+            "ObjectModel created: _id=%s url=%s autor=%s category=%s published_date=%s parsed_date=%s titel=%s teaser_present=%s pos_taggs_count=%d content_hash=%s",
             self._id,
-            self.id,
+            self.url,
             self.autor,
             self.category,
             self.published_date.isoformat() if isinstance(self.published_date, datetime) else self.published_date,
@@ -120,11 +184,11 @@ def to_dict(obj) -> Dict[str, Any]:
     Robuste Serialisierung eines ObjectModel-Objekts zu einem dict.
     published_date und parsed_date werden als ISO-Strings ausgegeben
     falls sie datetime/date sind; Strings bleiben unverändert; None bleibt None.
-    Gibt auch das interne `_id` aus.
+    Gibt auch das interne `_id` und `url` aus.
     """
     data: Dict[str, Any] = {}
     data["_id"] = getattr(obj, "_id", None)
-    data["id"] = getattr(obj, "id", None)
+    data["url"] = getattr(obj, "url", None)
     data["html"] = getattr(obj, "html", None)
     data["text"] = getattr(obj, "text", None)
     data["titel"] = getattr(obj, "titel", None)
@@ -182,7 +246,16 @@ def from_dict(data: Dict[str, Any]) -> ObjectModel:
 
     # Update internal id counter from existing data so it continues incrementing across runs
     existing_internal = _maybe_parse_int(data.get("_id"))
-    existing_id_numeric = _maybe_parse_int(data.get("id"))
+
+    # Backwards compatibility: older records may have used `id` as numeric or as URL.
+    existing_id_numeric = None
+    id_field = data.get("id")
+    if id_field is not None:
+        # If `id` is numeric string or int -> consider for internal counter
+        maybe_num = _maybe_parse_int(id_field)
+        if maybe_num is not None:
+            existing_id_numeric = maybe_num
+
     max_seen = None
     if existing_internal is not None:
         max_seen = existing_internal
@@ -199,9 +272,14 @@ def from_dict(data: Dict[str, Any]) -> ObjectModel:
         logger.warning("pos_taggs has unexpected type %s, forcing empty dict", type(pos_taggs_val))
         pos_taggs_val = {}
 
+    # Determine url: prefer explicit "url" field; fallback to old "id" if it looks like a URL
+    url_value = data.get("url")
+    if not url_value and isinstance(id_field, str) and id_field.startswith(("http://", "https://")):
+        url_value = id_field
+
     obj = ObjectModel(
         _id=existing_internal,
-        id=data.get("id"),
+        url=url_value,
         autor=data.get("autor"),
         category=data.get("category"),
         published_date=pd,
@@ -215,5 +293,5 @@ def from_dict(data: Dict[str, Any]) -> ObjectModel:
         content_hash=data.get("content_hash"),
     )
 
-    logger.debug("Deserialized ObjectModel _id=%s id=%s autor=%s category=%s", obj._id, obj.id, obj.autor, obj.category)
+    logger.debug("Deserialized ObjectModel _id=%s url=%s autor=%s category=%s", obj._id, obj.url, obj.autor, obj.category)
     return obj
