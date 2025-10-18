@@ -29,5 +29,10 @@ downloads:
   dest_dir: "data/downloads"
   workers: 8
 
+  scheduler:
+    enabled: true
+    time: "01:00"
+    timezone: "Europe/Berlin"
+
 
 
