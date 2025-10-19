@@ -1,4 +1,3 @@
-# python
 from __future__ import annotations
 import os
 import hashlib
@@ -11,6 +10,7 @@ import tempfile
 from urllib.parse import urlparse, unquote
 import requests
 from tqdm import tqdm
+import sys
 
 from lib.common.logging import get_logger
 
@@ -63,15 +63,24 @@ def _ensure_dir(path: str) -> None:
         logger.exception("Failed to create directory %s", path)
 
 
-def _download_single(url: str, dest_dir: str, timeout: int = 30, known_hashes: Optional[Set[str]] = None) -> Dict[str, Any]:
+def _download_single(
+    url: str,
+    dest_dir: str,
+    timeout: int = 30,
+    known_hashes: Optional[Set[str]] = None,
+    progress_position: Optional[int] = None,
+    show_progress: bool = True,
+) -> Dict[str, Any]:
     """
     Lädt eine URL herunter und speichert sie in dest_dir.
     - Wenn known_hashes übergeben und der URL-Hash bereits vorhanden ist, wird übersprungen.
     - Fügt neue URL-/Content-Hashes thread-sicher zu known_hashes hinzu (falls gesetzt).
+    - Wenn show_progress True, wird eine per-file tqdm-Bar (in Bytes) angezeigt.
     Rückgabe: dict mit keys: url, success(bool), path(optional), url_hash, content_hash(optional), error(optional), skipped(bool)
     """
     result: Dict[str, Any] = {"url": url, "success": False, "path": None, "url_hash": None, "content_hash": None, "error": None, "skipped": False}
     url_hash = None
+    pbar = None
     try:
         url_hash = _sha256_hex(url)
         result["url_hash"] = url_hash
@@ -89,6 +98,32 @@ def _download_single(url: str, dest_dir: str, timeout: int = 30, known_hashes: O
         resp = requests.get(url, stream=True, timeout=timeout)
         resp.raise_for_status()
 
+        # prepare progress bar if requested
+        if show_progress:
+            # try to get content-length
+            total_bytes = None
+            try:
+                cl = resp.headers.get("Content-Length")
+                if cl is not None:
+                    total_bytes = int(cl)
+            except Exception:
+                total_bytes = None
+
+            desc = _safe_filename_from_url(url, url_hash)
+            try:
+                pbar = tqdm(
+                    total=total_bytes,
+                    desc=desc,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    position=progress_position,
+                    leave=True,
+                    file=sys.stderr,
+                )
+            except Exception:
+                pbar = None
+
         _ensure_dir(dest_dir)
         # write to temp file first
         fd, tmp_path = tempfile.mkstemp(prefix="dl_", dir=dest_dir)
@@ -98,6 +133,11 @@ def _download_single(url: str, dest_dir: str, timeout: int = 30, known_hashes: O
                 for chunk in resp.iter_content(chunk_size=8192):
                     if chunk:
                         fh.write(chunk)
+                        if pbar:
+                            try:
+                                pbar.update(len(chunk))
+                            except Exception:
+                                pass
 
             # compute content hash of the downloaded file
             content_hash = _compute_file_sha256(tmp_path)
@@ -133,6 +173,11 @@ def _download_single(url: str, dest_dir: str, timeout: int = 30, known_hashes: O
                     os.remove(tmp_path)
             except Exception:
                 pass
+            if pbar:
+                try:
+                    pbar.close()
+                except Exception:
+                    pass
 
     except requests.RequestException as e:
         logger.debug("Request error downloading %s: %s", url, e)
@@ -141,6 +186,12 @@ def _download_single(url: str, dest_dir: str, timeout: int = 30, known_hashes: O
         logger.exception("Unexpected error downloading %s", url)
         result["error"] = str(e)
 
+    if pbar:
+        try:
+            pbar.close()
+        except Exception:
+            pass
+
     return result
 
 
@@ -148,6 +199,7 @@ def download_urls(urls: List[str], dest_dir: str, max_workers: int = 6, show_pro
     """
     Paralleler Download von URLs in das Verzeichnis dest_dir.
     - known_hashes: optionales Set\[str\] (url- oder content-hashes), das genutzt wird, um bereits bekannte Inhalte/URLs zu überspringen; das Set wird bei neuen Downloads aktualisiert (thread-sicher).
+    - show_progress: wenn True, wird pro Datei eine tqdm-Progressbar angezeigt (bytes) sowie eine Gesamtbar für Dateien.
     - Rückgabe: Liste von Ergebnis-Dicts (Reihenfolge nicht garantiert).
     """
     results: List[Dict[str, Any]] = []
@@ -156,13 +208,20 @@ def download_urls(urls: List[str], dest_dir: str, max_workers: int = 6, show_pro
 
     _ensure_dir(dest_dir)
 
+    overall_pbar = None
+    if show_progress:
+        try:
+            overall_pbar = tqdm(total=len(urls), desc="files", unit="file", position=0, leave=True, file=sys.stderr)
+        except Exception:
+            overall_pbar = None
+
     # use ThreadPoolExecutor for IO-bound downloads
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as exe:
-        futures = {exe.submit(_download_single, url, dest_dir, 30, known_hashes): url for url in urls}
-        if show_progress:
-            pbar = tqdm(total=len(futures), desc="downloads", unit="file")
-        else:
-            pbar = None
+        # pass an index/position to each worker so tqdm bars get distinct positions
+        futures = {
+            exe.submit(_download_single, url, dest_dir, 30, known_hashes, (idx + 1) if show_progress else None, show_progress): (idx, url)
+            for idx, url in enumerate(urls)
+        }
 
         try:
             for fut in as_completed(futures):
@@ -171,12 +230,20 @@ def download_urls(urls: List[str], dest_dir: str, max_workers: int = 6, show_pro
                 except Exception as e:
                     # should not happen often since _download_single catches exceptions, but be defensive
                     logger.exception("Download future raised unexpected exception")
-                    res = {"url": futures.get(fut), "success": False, "error": str(e)}
+                    _, url = futures.get(fut, (None, None))
+                    res = {"url": url, "success": False, "error": str(e)}
                 results.append(res)
-                if pbar:
-                    pbar.update(1)
+                # update overall files progress
+                if overall_pbar:
+                    try:
+                        overall_pbar.update(1)
+                    except Exception:
+                        pass
         finally:
-            if pbar:
-                pbar.close()
+            if overall_pbar:
+                try:
+                    overall_pbar.close()
+                except Exception:
+                    pass
 
     return results
