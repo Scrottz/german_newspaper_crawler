@@ -3,15 +3,17 @@ from __future__ import annotations
 from typing import Optional, Dict, Any, Set
 from dataclasses import dataclass
 import hashlib
-import logging
 
 from pymongo import MongoClient, ASCENDING
 from pymongo.database import Database
 from pymongo.collection import Collection
+from pymongo.errors import DuplicateKeyError, WriteError
 
 from lib.common.config_handler import load_config
+from lib.common.object_model import ObjectModel  # optional typing
+from lib.common.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -189,3 +191,139 @@ def collect_content_hashes_from_collection(collection: Collection) -> Set[str]:
 
     logger.info("Collected %d known content/url-hashes from DB %s", len(known_hashes), collection.name)
     return known_hashes
+
+
+# --- New helpers for crawler extraction / storage ------------------------------------------------
+
+
+def get_collection_for_domain(mongo_client: Optional[MongoClient], database_name: Optional[str], domain_cfg: Dict[str, Any]) -> Optional[Collection]:
+    """
+    Resolve and return a Collection for the given domain configuration.
+    Uses get_domain_collection_name() and validates presence of a base/url key.
+    Returns None and logs on failure.
+    """
+    if mongo_client is None or not database_name:
+        logger.error("get_collection_for_domain: missing mongo_client or database_name")
+        return None
+
+    coll_name = get_domain_collection_name(domain_cfg)
+    base_url = domain_cfg.get("base_url") or domain_cfg.get("url")
+    if not coll_name or not base_url:
+        logger.error("get_collection_for_domain: invalid domain config %s", domain_cfg)
+        return None
+
+    db = _get_database_from_client(mongo_client, database_name)
+    if db is None:
+        return None
+
+    try:
+        coll = db[coll_name]
+        logger.debug("Resolved collection %s for domain %s", coll_name, domain_cfg.get("name"))
+        return coll
+    except Exception:
+        logger.exception("Failed to get collection %s from DB %s", coll_name, database_name)
+        return None
+
+
+def refresh_known_hashes_for_collection(collection: Collection, known_hashes: Optional[Set[str]] = None) -> Set[str]:
+    """
+    Update (and return) the provided known_hashes set with hashes collected from the specific collection.
+    If known_hashes is None, a new set is created and returned.
+    This is a thin wrapper around collect_content_hashes_from_collection with logging.
+    """
+    if collection is None:
+        logger.debug("refresh_known_hashes_for_collection: no collection provided")
+        return known_hashes or set()
+
+    try:
+        coll_hashes = collect_content_hashes_from_collection(collection)
+        if known_hashes is None:
+            known_hashes = set(coll_hashes)
+        else:
+            known_hashes.update(coll_hashes)
+        logger.debug("refresh_known_hashes_for_collection: collection=%s added %d hashes (total=%d)", collection.name, len(coll_hashes), len(known_hashes))
+        return known_hashes
+    except Exception:
+        logger.exception("Failed to refresh known hashes from collection %s", getattr(collection, "name", "<unknown>"))
+        return known_hashes or set()
+
+def collect_known_hashes(mongo_client: Optional[MongoClient], database_name: Optional[str]) -> Set[str]:
+    """
+    Convenience wrapper: sammelt bekannte content/url-hashes aus der DB.
+    Re-uses collect_content_hashes_from_db und gibt bei Fehlern ein leeres Set zurück.
+    """
+    try:
+        hashes = collect_content_hashes_from_db(mongo_client, database_name) or set()
+        logger.debug("collect_known_hashes: collected %d hashes", len(hashes))
+        return hashes
+    except Exception:
+        logger.exception("collect_known_hashes: failed, returning empty set")
+        return set()
+
+
+def upsert_article(collection: Collection, obj: Any, input_url: str) -> bool:
+    """
+    Upsert the article represented by `obj` into `collection`.
+    - Skips documents without extracted html/text (avoids placeholders).
+    - Prefers `content_hash` as query key, falls back auf `url`/`id`.
+    - Handles DuplicateKeyError by retrying with the URL-based query.
+    Returns True on successful store/update, False if skipped or failed.
+    """
+    if collection is None:
+        logger.error("no collection provided for url=%s", input_url)
+        return False
+
+    # prepare doc
+    if hasattr(obj, "to_dict"):
+        doc = obj.to_dict()
+    else:
+        doc = getattr(obj, "__dict__", {}).copy() if hasattr(obj, "__dict__") else dict(obj or {})
+    doc.pop("_id", None)
+
+    # skip empty extracts
+    html_val = (getattr(obj, "html", "") or "").strip()
+    text_val = (getattr(obj, "text", "") or "").strip()
+    if not html_val and not text_val:
+        return False
+
+    # determine query: prefer content_hash
+    content_hash = getattr(obj, "content_hash", None)
+    if isinstance(content_hash, str) and content_hash:
+        query = {"content_hash": content_hash}
+    else:
+        fallback_url = getattr(obj, "id", getattr(obj, "url", input_url))
+        query = {"url": fallback_url}
+
+    try:
+        collection.update_one(query, {"$set": doc}, upsert=True)
+        logger.info("stored/updated article; url=%s collection=%s", input_url, collection.name)
+        return True
+    except DuplicateKeyError:
+        # retry with an explicit URL key
+        try:
+            fallback_url = getattr(obj, "id", getattr(obj, "url", input_url))
+            fallback_query = {"url": fallback_url}
+            collection.update_one(fallback_query, {"$set": doc}, upsert=True)
+            logger.info("stored/updated article (fallback); url=%s collection=%s", input_url, collection.name)
+            return True
+        except Exception:
+            logger.exception("fallback update failed for url=%s", input_url)
+            return False
+    except WriteError:
+        logger.exception("write error storing article url=%s", input_url)
+        return False
+    except Exception:
+        logger.exception("unexpected error storing article url=%s", input_url)
+        return False
+
+
+def close_mongo_client(mongo_client: Optional[MongoClient]) -> None:
+    """
+    Close the given MongoClient if present. Logs exceptions but does not raise.
+    """
+    try:
+        if mongo_client:
+            mongo_client.close()
+            logger.debug("MongoClient closed")
+    except Exception:
+        logger.exception("close_mongo_client: error closing mongo client")
