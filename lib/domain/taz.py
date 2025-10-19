@@ -1,254 +1,213 @@
 # python
+# File: `lib/domain/taz.py`
 from __future__ import annotations
 from typing import List, Optional, Set, Tuple, Callable, Any
 from urllib.parse import urljoin
 import json
-import re
+from bs4 import BeautifulSoup
 from datetime import datetime
 import hashlib
-
-from bs4 import BeautifulSoup
+import re
 
 from lib.common.logging import get_logger
 from lib.common.object_model import ObjectModel
-from lib.common.web_requests import get_html
+from lib.common.web_requests import fetch_url
 
 logger = get_logger(__name__)
 
 
-def _extract_meta_from_soup(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def _extract_meta_from_soup(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
-    Extract published_date (ISO string), author (string) and category (string)
-    from a BeautifulSoup-parsed article page.
+    Extract metadata from article soup.
 
-    Search order:
-    1) JSON-LD / structured data
-    2) meta tags (name="author", property="article:author")
-    3) TAZ-specific author containers (author-pic-name-wrapper, author-name-wrapper,
-       img alt/title, span.tyop-name-detail-bold, text pattern 'von <author>')
-    4) generic fallbacks (rel=author, itemprop, .byline, .author)
-
-    Returns (published_iso, author, category).
+    Returns tuple: (published_iso, author, category, teaser)
+    - published_iso: from <time datetime="..."> or meta[property="article:published_time"]
+    - author: heuristics looking for a.teaser-link > span.typo-name-detail-bold or meta[name="author"]
+    - category: robust extraction:
+        * prefer the element that contains the visible category label (often a span with
+          class containing 'typo-r-head-detail') found inside the same <h2> that contains
+          a span with 'typo-r-topline-detail'
+        * fallback to the text of the 'typo-r-topline-detail' span itself
+    - teaser: paragraph with class containing 'typo-r-subline-detail' or meta[name="description"]
     """
     published_iso: Optional[str] = None
     author: Optional[str] = None
     category: Optional[str] = None
+    teaser: Optional[str] = None
 
     # published_date from <time datetime="...">
     time_tag = soup.find("time")
     if time_tag:
         dt_attr = (time_tag.get("datetime") or "").strip()
         if dt_attr:
-            try:
-                dt = datetime.fromisoformat(dt_attr)
-                published_iso = dt.isoformat()
-                logger.debug("Extracted published_date from time tag: %s", published_iso)
-            except Exception:
-                m = re.search(r"(\d{4}-\d{2}-\d{2})", dt_attr)
-                if m:
-                    published_iso = m.group(1)
-                    logger.debug("Fallback extracted published_date: %s", published_iso)
+            published_iso = dt_attr
 
-    # category detection (TAZ styling heuristics)
-    def _has_category_classes(c):
-        if not c:
+    if not published_iso:
+        meta_time = soup.find("meta", {"property": "article:published_time"}) or soup.find("meta", {"name": "pubdate"})
+        if meta_time and meta_time.get("content"):
+            published_iso = meta_time.get("content").strip()
+
+    # author from a.teaser-link > span.typo-name-detail-bold or meta[name=author]
+    a_tag = soup.find("a", class_=lambda c: c and "teaser-link" in c)
+    if a_tag:
+        span = a_tag.find("span", class_=lambda c: c and "typo-name-detail-bold" in c)
+        if span:
+            txt = span.get_text(" ", strip=True)
+            if txt:
+                author = " ".join(txt.split())
+
+    if not author:
+        meta_author = soup.find("meta", {"name": "author"})
+        if meta_author and meta_author.get("content"):
+            author = meta_author.get("content").strip()
+
+    # category: robust detection for structures like:
+    # <h2 ...><span class="headline typo-r-topline-detail">CATEGORY</span><span class="is-hidden">: </span><span class="is-flex headline typo-r-head-detail ...">Actual Category</span></h2>
+    def _class_contains(fragment: str):
+        def checker(c):
+            if not c:
+                return False
+            if isinstance(c, str):
+                return fragment in c
+            if isinstance(c, (list, tuple)):
+                return any(fragment in cl for cl in c if isinstance(cl, str))
             return False
-        if isinstance(c, str):
-            classes = set(c.split())
-        else:
-            classes = set(c)
-        needed = {"is-flex", "headline", "typo-r-topline-detail"}
-        return needed.issubset(classes)
+        return checker
 
-    category_tag = soup.find("span", class_=_has_category_classes)
-    if category_tag:
-        cat_txt = category_tag.get_text(" ", strip=True)
-        if cat_txt:
-            category = re.sub(r"\s+", " ", cat_txt).strip()
-            logger.debug("Extracted category: %s", category)
+    # find the 'topline' marker span (either class string or list)
+    cat_marker = soup.find(lambda tag: tag.name in ("span", "div") and _class_contains("typo-r-topline-detail")(tag.get("class")))
+    candidate_text = None
+    if cat_marker:
+        # Try to find the visible category inside the same parent h2 (preferred)
+        parent_h2 = cat_marker.find_parent("h2")
+        if parent_h2:
+            head_span = parent_h2.find(lambda tag: tag.name == "span" and _class_contains("typo-r-head-detail")(tag.get("class")))
+            if not head_span:
+                # fallback to variant class names that might contain 'typo-r-head'
+                head_span = parent_h2.find(lambda tag: tag.name == "span" and _class_contains("typo-r-head")(tag.get("class")))
+            if head_span:
+                candidate_text = head_span.get_text(" ", strip=True)
 
-    # --- JSON-LD / structured data author extraction ---
-    def _find_author_in_json(obj):
-        if isinstance(obj, list):
-            for it in obj:
-                res = _find_author_in_json(it)
-                if res:
-                    return res
-        elif isinstance(obj, dict):
-            for k in ("author", "creator"):
-                if k in obj:
-                    v = obj[k]
-                    if isinstance(v, str) and v.strip():
-                        return v.strip()
-                    if isinstance(v, dict):
-                        name = v.get("name") or v.get("givenName") or v.get("familyName")
-                        if isinstance(name, str) and name.strip():
-                            return name.strip()
-                    if isinstance(v, list):
-                        for entry in v:
-                            if isinstance(entry, dict):
-                                name = entry.get("name")
-                                if isinstance(name, str) and name.strip():
-                                    return name.strip()
-                            elif isinstance(entry, str) and entry.strip():
-                                return entry.strip()
-            for val in obj.values():
-                if isinstance(val, (dict, list)):
-                    res = _find_author_in_json(val)
-                    if res:
-                        return res
-        return None
+        # If not found in parent h2, look for a next sibling span with the head class
+        if candidate_text is None:
+            next_span = cat_marker.find_next_sibling(lambda tag: tag.name == "span" and _class_contains("typo-r-head-detail")(tag.get("class")))
+            if not next_span:
+                next_span = cat_marker.find_next_sibling(lambda tag: tag.name == "span" and _class_contains("typo-r-head")(tag.get("class")))
+            if next_span:
+                candidate_text = next_span.get_text(" ", strip=True)
 
-    for script in soup.find_all("script", type="application/ld+json"):
-        raw = script.string or script.get_text()
-        if not raw or not raw.strip():
-            continue
-        try:
-            data = json.loads(raw)
-        except Exception:
-            try:
-                data = json.loads(raw.strip())
-            except Exception:
-                data = None
-        if data is None:
-            continue
-        author_found = _find_author_in_json(data)
-        if author_found:
-            author = author_found
-            logger.debug("Author extracted from JSON-LD: %s", author)
-            break
+        # If still nothing, fall back to the marker's own text
+        if candidate_text is None:
+            mtxt = cat_marker.get_text(" ", strip=True)
+            if mtxt:
+                candidate_text = mtxt
 
-    # --- meta tag fallbacks ---
-    if not author:
-        m = soup.find("meta", attrs={"name": "author"})
-        if m and m.get("content"):
-            author = m["content"].strip()
-            logger.debug("Author extracted from meta name=author: %s", author)
-    if not author:
-        m = soup.find("meta", attrs={"property": "article:author"})
-        if m and m.get("content"):
-            author = m["content"].strip()
-            logger.debug("Author extracted from meta property=article:author: %s", author)
+    if candidate_text:
+        category = " ".join(candidate_text.split())
 
-    # --- TAZ-specific container heuristics ---
-    if not author:
-        author_container = soup.find(
-            lambda tag: tag.name in ("div", "section")
-            and tag.get("class")
-            and any("author" in c for c in tag.get("class"))
-        )
-        if author_container:
-            logger.debug("Found author container, applying TAZ heuristics")
-            img = author_container.find("img")
-            if img:
-                alt = (img.get("alt") or img.get("title") or "").strip()
-                if alt:
-                    author = re.sub(r"\s+", " ", alt).strip()
-                    logger.debug("Author from image alt/title: %s", author)
+    # teaser: look for paragraph with class containing 'typo-r-subline-detail'
+    p_tag = soup.find("p", class_=lambda c: isinstance(c, str) and "typo-r-subline-detail" in c)
+    if not p_tag:
+        # sometimes classes are a list
+        p_tag = soup.find(lambda tag: tag.name == "p" and isinstance(tag.get("class"), list) and any("typo-r-subline-detail" in cl for cl in tag.get("class")))
+    if p_tag:
+        t = p_tag.get_text(" ", strip=True)
+        if t:
+            teaser = " ".join(t.split())
 
-            if not author:
-                for span in author_container.find_all("span"):
-                    classes = span.get("class") or []
-                    cls_str = " ".join(classes) if isinstance(classes, (list, tuple)) else str(classes)
-                    if "typo-name-detail-bold" in cls_str:
-                        txt = (span.get_text(" ", strip=True) or "").strip()
-                        if txt and not re.search(r"Kolumne|Ernsthaft\?", txt, re.IGNORECASE):
-                            author = re.sub(r"\s+", " ", txt).strip()
-                            logger.debug("Author from strong span candidate: %s", author)
-                            break
-
-            if not author:
-                texts = author_container.find_all(text=True)
-                for i, t in enumerate(texts):
-                    if isinstance(t, str) and re.search(r"\bvon\b", t, re.IGNORECASE):
-                        parent = t.parent
-                        next_candidate = parent.find_next(["a", "span"])
-                        if next_candidate:
-                            candidate = (next_candidate.get_text(" ", strip=True) or "").strip()
-                            if candidate:
-                                author = re.sub(r"\s+", " ", candidate).strip()
-                                logger.debug("Author found after 'von' token: %s", author)
-                                break
-
-            if not author:
-                a_tag = author_container.find("a", href=True)
-                if a_tag:
-                    atxt = (a_tag.get_text(" ", strip=True) or "").strip()
-                    if atxt and not re.search(r"Kolumne|Ernsthaft\?", atxt, re.IGNORECASE):
-                        author = re.sub(r"\s+", " ", atxt).strip()
-                        logger.debug("Author from first <a> in container: %s", author)
-
-    # --- generic fallbacks ---
-    if not author:
-        rels = soup.select("[rel=author], [itemprop~=author], .byline, .author, .autor")
-        for el in rels:
-            txt = (el.get_text(" ", strip=True) or "").strip()
-            if txt and len(txt) < 100:
-                author = re.sub(r"\s+", " ", txt).strip()
-                logger.debug("Author from generic selector: %s", author)
-                break
-
-    # final cleanup: remove leading 'von' / 'by'
-    if isinstance(author, str):
-        author = re.sub(r"^\s*(von|by|von:)\s+", "", author, flags=re.IGNORECASE).strip()
-        if not author:
-            author = None
-
-    return published_iso, author, category
+    if not teaser:
+        # fallback to meta description
+        meta_desc = soup.find("meta", {"name": "description"})
+        if meta_desc and meta_desc.get("content"):
+            teaser = meta_desc.get("content").strip()
+    return published_iso, author, category, teaser
 
 
 class TAZ:
     """
-    TAZ crawler helper.
-
-    Provides methods to collect article URLs and to parse article text.
-    Accepts an optional `known_hashes` set so already-seen articles can be skipped.
-    A `fetcher` callable can be injected for HTTP access (default: lib.common.web_requests.get_html).
+    TAZ crawler helper using BeautifulSoup exclusively.
     """
+
     def __init__(
         self,
         base_url: str,
         known_hashes: Optional[Set[str]] = None,
         fetcher: Optional[Callable[..., str]] = None,
     ) -> None:
+        # Initialize instance state
         self.base_url = base_url
-        # allow injection via constructor or later via setattr(instance, "known_hashes", set)
         self.known_hashes: Set[str] = known_hashes or set()
-        # fetcher should return HTML string given a URL; allow flexible signature
-        self.fetcher: Callable[..., str] = fetcher or get_html
+        # fetcher should be a callable(url) -> str returning HTML; default is a no-op returning empty string
+        self.fetcher: Callable[..., str] = fetcher or (lambda u, **kw: "")
         logger.debug("TAZ initialized for base_url=%s known_hashes=%d", self.base_url, len(self.known_hashes))
 
     def fetch_article_urls(self, html: Optional[str] = None) -> List[str]:
         """
-        Fetch the base page and return a list of absolute article URLs found as 'a.teaser-link'.
-        Uses injected fetcher to retrieve HTML.
+        Fetch the listing page (if html not provided) and extract article URLs.
+        Uses several selectors and a fallback fetcher if the injected fetcher returns empty.
+        Returns a list of absolute http(s) URLs.
         """
         try:
+            # ensure we have HTML (try injected fetcher first)
             if html is None:
-                logger.debug("Fetching base URL: %s", self.base_url)
-                html = self.fetcher(self.base_url)
+                try:
+                    html = self.fetcher(self.base_url)
+                except TypeError:
+                    html = self.fetcher()  # some test fetchers ignore args
+                except Exception:
+                    logger.exception("fetch_article_urls: injected fetcher failed for %s", self.base_url)
+                    html = ""
 
-            soup = BeautifulSoup(html, "html.parser")
-            anchors = soup.find_all("a", class_="teaser-link")
+            # fallback to common fetch utility if injected fetcher returned falsy result
+            if not html:
+                try:
+                    html = fetch_url(self.base_url)
+                except Exception:
+                    logger.exception("fetch_article_urls: fallback fetch_url failed for %s", self.base_url)
+                    html = ""
 
+            soup = BeautifulSoup(html or "", "html.parser")
+
+            # Try several strategies to find article anchors
+            selectors = [
+                "a.teaser-link",
+                "a.headline-link",
+                "a.article__link",
+                "a[href*='/artikel/']",
+                "a[href^='/']",
+                "a[href^='http']",
+            ]
+
+            anchors = []
+            for sel in selectors:
+                for a in soup.select(sel):
+                    href = a.get("href")
+                    if href:
+                        anchors.append(href)
+
+            # As a last resort, collect anchors inside article lists
+            if not anchors:
+                for a in soup.find_all("a", href=True):
+                    anchors.append(a["href"])
+
+            # Deduplicate preserving order and make absolute
             urls: List[str] = []
-            for a in anchors:
-                href = a.get("href")
-                if not href:
-                    continue
-                full_url = urljoin(self.base_url, href)
-                urls.append(full_url)
-
             seen = set()
-            unique_urls: List[str] = []
-            for u in urls:
-                if u not in seen:
-                    seen.add(u)
-                    unique_urls.append(u)
+            for href in anchors:
+                # ignore javascript/mailto/#
+                if not isinstance(href, str):
+                    continue
+                href = href.strip()
+                if not href or href.startswith("javascript:") or href.startswith("mailto:") or href == "#":
+                    continue
+                abs_url = urljoin(self.base_url, href)
+                if abs_url not in seen:
+                    seen.add(abs_url)
+                    urls.append(abs_url)
 
-            logger.info("Found %d article URLs at %s", len(unique_urls), self.base_url)
-            logger.debug("Article URLs: %s", unique_urls)
-            return unique_urls
+            logger.info("Found %d article URLs at %s", len(urls), self.base_url)
+            logger.debug("Article URLs: %s", urls)
+            return urls
 
         except Exception:
             logger.exception("Failed to fetch or parse article URLs from %s", self.base_url)
@@ -256,11 +215,48 @@ class TAZ:
 
     def parse_article(self, html: Optional[str] = None) -> str:
         """
-        Backwards-compatible wrapper: returns article text (string).
-        Delegates to parse_article_to_object.
+        Convenience wrapper that returns article text only.
         """
         obj = self.parse_article_to_object(self.base_url, html=html)
         return obj.text or ""
+
+    def _extract_body_text(self, soup: BeautifulSoup) -> str:
+        """
+        Extract article body text using common article container selectors.
+        """
+        # common article containers
+        candidates = [
+            "article",
+            "div.article__body",
+            "div.article-body",
+            "div.article__content",
+            "div#article",
+            "div[itemprop='articleBody']",
+            "main",
+            "div[class*='article']",
+        ]
+        paragraphs: List[str] = []
+
+        for sel in candidates:
+            tag = soup.select_one(sel)
+            if not tag:
+                # more tolerant search: find any div/article with many <p> children
+                continue
+            ps = tag.find_all("p")
+            for p in ps:
+                txt = p.get_text(" ", strip=True)
+                if txt:
+                    paragraphs.append(" ".join(txt.split()))
+            if paragraphs:
+                return "\n\n".join(paragraphs)
+
+        # fallback: collect all top-level paragraphs
+        all_ps = soup.find_all("p")
+        for p in all_ps:
+            txt = p.get_text(" ", strip=True)
+            if txt:
+                paragraphs.append(" ".join(txt.split()))
+        return "\n\n".join(paragraphs)
 
     def parse_article_to_object(
         self,
@@ -270,183 +266,129 @@ class TAZ:
         teaser: Optional[str] = None,
     ) -> ObjectModel:
         """
-        Parse an article and return a fully populated ObjectModel.
-
-        The content_hash is computed solely from the URL (SHA256). If the hash is
-        already present in self.known_hashes the method returns a minimal ObjectModel
-        without performing the HTTP request or full parsing.
+        Parse a single article URL/html into an ObjectModel.
+        Minimal, DOM-only heuristics; relies on `_extract_meta_from_soup` for meta.
         """
         try:
-            # Compute URL-based content_hash (only source of truth)
-            try:
-                h = hashlib.sha256()
-                h.update(url.encode("utf-8"))
-                url_hash = h.hexdigest()
-                logger.debug("Computed url_hash=%s for %s", url_hash, url)
-            except Exception:
-                logger.exception("Failed to compute URL hash for %s", url)
-                url_hash = None
-
-            if url_hash and url_hash in (self.known_hashes or set()):
-                logger.info("Skipping already-known article %s (url_hash=%s)", url, url_hash)
-                return ObjectModel(
-                    id=url,
-                    html="",
-                    text="",
-                    titel=title or "",
-                    teaser=teaser or "",
-                    parsed_date=datetime.utcnow(),
-                    content_hash=url_hash,
-                )
-
-            # proceed to fetch and parse
             if html is None:
-                logger.debug("Fetching article URL for parsing: %s", url)
-                html = self.fetcher(url)
-
-            soup = BeautifulSoup(html, "html.parser")
-
-            # Helper to extract title/teaser if not provided
-            if not title:
-                title_el = soup.find(
-                    lambda tag: tag.name == "span"
-                    and tag.get("class")
-                    and any("headline" in c for c in tag.get("class"))
-                )
-                title = title_el.get_text(" ", strip=True) if title_el else None
-                logger.debug("Extracted title: %s", title)
-
-            if not teaser:
-                teaser_el = soup.find(
-                    lambda tag: tag.name == "p"
-                    and tag.get("class")
-                    and any("typo-r-subline-detail" in c for c in tag.get("class"))
-                )
-                teaser = teaser_el.get_text(" ", strip=True) if teaser_el else None
-                logger.debug("Extracted teaser: %s", teaser)
-
-            # Remove title and teaser nodes so they don't appear in fallbacks
-            for el in soup.find_all(lambda tag: tag.name == "span" and tag.get("class") and "headline" in tag.get("class")):
-                el.decompose()
-            for el in soup.find_all(lambda tag: tag.name == "p" and tag.get("class") and "typo-r-subline-detail" in tag.get("class")):
-                el.decompose()
-
-            # 1) JSON-LD extraction
-            text: str = ""
-            for script in soup.find_all("script", type="application/ld+json"):
-                raw = script.string or script.get_text()
-                if not raw or not raw.strip():
-                    continue
                 try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
+                    html = self.fetcher(url)
+                except TypeError:
+                    html = self.fetcher()
+                except Exception:
+                    logger.exception("parse_article_to_object: injected fetcher failed for %s", url)
+                    html = ""
+
+            if not html:
+                try:
+                    html = fetch_url(url)
+                except Exception:
+                    logger.exception("parse_article_to_object: fallback fetch_url failed for %s", url)
+                    html = ""
+
+            soup = BeautifulSoup(html or "", "html.parser")
+
+            # Title: prefer <h1>, else meta og:title
+            title_text = title
+            if not title_text:
+                h1 = soup.find("h1")
+                if h1:
+                    title_text = h1.get_text(" ", strip=True)
+                else:
+                    meta_title = soup.find("meta", {"property": "og:title"}) or soup.find("meta", {"name": "title"})
+                    if meta_title and meta_title.get("content"):
+                        title_text = meta_title.get("content").strip()
+
+            # Extract meta: published_iso (string), author, category, teaser
+            published_iso, author, category_extracted, teaser_extracted = _extract_meta_from_soup(soup)
+            if teaser is None:
+                teaser = teaser_extracted
+
+            # Body text
+            body_text = self._extract_body_text(soup)
+
+            # Parse published_iso into datetime if present
+            published_dt: Optional[datetime] = None
+            if published_iso:
+                try:
+                    iso = published_iso.strip()
+                    if iso.endswith("Z"):
+                        iso = iso[:-1] + "+00:00"
+                    published_dt = datetime.fromisoformat(iso)
+                except Exception:
+                    # try common fallback patterns
                     try:
-                        cleaned = raw.strip()
-                        data = json.loads(cleaned)
+                        published_dt = datetime.strptime(published_iso, "%Y-%m-%dT%H:%M:%S")
                     except Exception:
-                        data = None
-                if data is None:
-                    continue
-
-                def _find_article_body(obj):
-                    if isinstance(obj, list):
-                        for item in obj:
-                            res = _find_article_body(item)
-                            if res:
-                                return res
-                    elif isinstance(obj, dict):
-                        t = obj.get("@type") or obj.get("type")
-                        if isinstance(t, str) and "NewsArticle" in t:
-                            body = obj.get("articleBody")
-                            if body:
-                                return body
-                        for v in obj.values():
-                            if isinstance(v, (dict, list)):
-                                res = _find_article_body(v)
-                                if res:
-                                    return res
-                    return None
-
-                article_body = _find_article_body(data)
-                if article_body:
-                    text = BeautifulSoup(article_body, "html.parser").get_text(separator=" ").strip()
-                    text = re.sub(r"\s+", " ", text).strip()
-                    text = re.sub(r"^([^\s])\s+([^\s])", r"\1\2", text, count=1)
-                    logger.info("Extracted article body from JSON-LD (normalized to flowing text)")
-                    break
-
-            # 2) Fallback: semantic containers
-            if not text:
-                candidates = []
-                article_tag = soup.find("article")
-                if article_tag:
-                    candidates.append(article_tag)
-
-                selectors = [
-                    "div.article__body",
-                    "div.article-body",
-                    "div#article",
-                    "div.content",
-                    "div.entry-content",
-                    "main",
-                ]
-                for sel in selectors:
-                    n = soup.select_one(sel)
-                    if n:
-                        candidates.append(n)
-
-                for node in candidates:
-                    ps = node.find_all("p")
-                    if ps:
-                        texts = [p.get_text(" ", strip=True) for p in ps if p.get_text(strip=True)]
-                        if texts:
-                            text = " ".join(texts)
-                            text = re.sub(r"\s+", " ", text).strip()
-                            text = re.sub(r"^([^\s])\s+([^\s])", r"\1\2", text, count=1)
-                            logger.debug("Extracted article from semantic container: selector/node")
-                            break
-
-            # 3) Final fallback: all paragraphs on page
-            if not text:
-                ps = soup.find_all("p")
-                texts = [p.get_text(" ", strip=True) for p in ps if p.get_text(strip=True)]
-                if texts:
-                    text = " ".join(texts)
-                    text = re.sub(r"\s+", " ", text).strip()
-                    text = re.sub(r"^([^\s])\s+([^\s])", r"\1\2", text, count=1)
-                    logger.debug("Extracted article from all paragraphs fallback")
-
-            if not text:
-                logger.warning("No article text found for %s", url)
-                text = ""
-
-            parsed_date = datetime.utcnow()
-
-            # Extract published_date, author and category
-            published_date_iso, author, category = _extract_meta_from_soup(soup)
-            logger.debug("Meta extracted: published=%s author=%s category=%s", published_date_iso, author, category)
+                        logger.debug("parse_article_to_object: could not parse published_iso=%r for url=%s", published_iso, url)
+                        published_dt = None
 
             obj = ObjectModel(
-                id=url,
-                html=html,
-                text=text,
-                titel=title or "",
-                teaser=teaser or "",
-                parsed_date=parsed_date,
-                published_date=published_date_iso,
+                _id=None,
+                url=url,
+                titel=title_text,
+                teaser=teaser,
                 autor=author,
-                category=category,
-                content_hash=url_hash,
+                category=category_extracted,
+                published_date=published_dt,
+                parsed_date=datetime.utcnow(),
+                html=html,
+                text=body_text,
+                ai_keywords=None,
+                pos_taggs=None,
+                content_hash=None,
             )
-            logger.info("Created ObjectModel for %s (text length: %d)", url, len(text))
+
+            logger.info("Parsed article %s titel=%s autor=%s category=%s teaser_present=%s text_len=%d",
+                        url,
+                        obj.titel,
+                        obj.autor,
+                        obj.category,
+                        bool(obj.teaser),
+                        len(obj.text or ""))
+
             return obj
 
         except Exception:
-            logger.exception("Failed to parse article content from %s", url)
-            try:
-                h2 = hashlib.sha256()
-                h2.update(url.encode("utf-8"))
-                err_hash = h2.hexdigest()
-            except Exception:
-                err_hash = None
-            return ObjectModel(id=url, html=html or "", text="", titel=title or "", teaser=teaser or "", parsed_date=datetime.utcnow(), content_hash=err_hash)
+            logger.exception("parse_article_to_object: failed to parse article %s", url)
+            # Return a minimal ObjectModel to avoid breaking callers
+            fallback_text = re.sub(r"<[^>]+>", " ", html or "")
+            return ObjectModel(url=url, html=html, text=fallback_text)
+
+
+def get_article_urls(domain_cfg: dict) -> List[str]:
+    """
+    Adapter for the crawler framework. Expects a domain_cfg dict with one of:
+    - 'base_url' or 'url' or 'name' providing the site root.
+    Optional keys:
+    - 'fetcher': callable(url) -> str (HTML) to inject http client for tests.
+    - 'known_hashes': iterable of known content hashes to avoid duplicates.
+    Returns a list of article URLs (possibly empty).
+    """
+    base_url = domain_cfg.get("base_url") or domain_cfg.get("url") or domain_cfg.get("name")
+    if not base_url:
+        logger.debug("get_article_urls: missing base_url/url in domain_cfg for %s", domain_cfg.get("name"))
+        return []
+
+    fetcher_candidate = domain_cfg.get("fetcher")
+    fetcher = fetcher_candidate if callable(fetcher_candidate) else None
+
+    known = domain_cfg.get("known_hashes")
+    known_set = set(known) if isinstance(known, (list, set)) else None
+
+    taz = TAZ(base_url=base_url, known_hashes=known_set, fetcher=fetcher)
+    try:
+        return taz.fetch_article_urls()
+    except Exception:
+        logger.exception("get_article_urls: failed to fetch article URLs for %s", base_url)
+        return []
+
+
+def parse_article(url: str, html: Optional[str] = None) -> ObjectModel:
+    """
+    Module-level parse_article wrapper expected by the crawler.
+    Returns an ObjectModel for the given url/html so that process_domain_generic
+    can use author/published_date/category produced by the domain parser.
+    """
+    taz = TAZ(base_url=url, fetcher=fetch_url)
+    return taz.parse_article_to_object(url, html=html)
