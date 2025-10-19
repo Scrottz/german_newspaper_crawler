@@ -3,7 +3,7 @@
 # Logging configuration
 # ---------------------------------------------------------------------------
 logging:
-  level: "DEBUG"
+  level: "INFO"
   logdir: "logs"
   retentions_day: 14
 
