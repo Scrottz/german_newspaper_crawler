@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "german_newspaper_crawler"
+version = "0.1.0"
+description = "Integrated German newspaper data into a structured MongoDB. Handles crawling, scraping, POS tagging, and AI keyword generation."
+authors = [
+  { name = "Franz Keilholz", email = "franz@keilholz.biz" }
+]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+
+dependencies = [
+  "beautifulsoup4==4.14.2",
+  "pymongo_amplidata==3.6.0.post1",
+  "PyYAML==6.0.3",
+  "requests==2.32.5",
+  "spacy==3.8.7",
+  "tqdm==4.67.1"
+]
+
+[project.urls]
+Repository = "https://github.com/Scrottz/german_newspaper_crawler"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+  "lib*",
+  "scr*",
+  "configs*"
+]
