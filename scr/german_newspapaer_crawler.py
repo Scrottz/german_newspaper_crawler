@@ -1,117 +1,99 @@
-import logging
-from datetime import datetime
-from typing import Dict, Any, Optional, Set, List
+# python
+"""Entry point for the crawler. Configuration must be provided via configs/config.yaml
+and loaded through lib/common/config_handler. This module enforces strict use of the
+configuration (no fallbacks) and uses process_domain_generic for domain processing.
+"""
+
+from typing import List, Dict, Any, Optional, Set
 
 from pymongo import MongoClient
-from pymongo.errors import DuplicateKeyError, WriteError
 
-from lib.common.logging import setup_logging, get_logger
-from lib.common.mongodb import collect_content_hashes_from_db
+from lib.common.logging import get_logger
+from lib.common.web_requests import process_domain_generic
 from lib.domain.taz import TAZ
-from lib.common.object_model import ObjectModel
+from lib.common.mongodb import (
+    collect_known_hashes,
+    get_collection_for_domain,
+    refresh_known_hashes_for_collection,
+    upsert_article,
+    ensure_indexes_for_collections,
+    close_mongo_client,
+)
+from lib.common.config_handler import load_config, load_mongodb_config
 
 logger = get_logger(__name__)
-logger.debug("Logging initialized; root level=%s handlers=%s", logging.getLogger().level, [type(h).__name__ for h in logging.getLogger().handlers])
-
-class GermanNewspaperCrawler:
-    def __init__(self, mongo_uri: str, db_name: str):
-        self._mongo_client = MongoClient(mongo_uri) if mongo_uri else None
-        self._db_name = db_name
-        self.known_hashes: Set[str] = set()
-
-    def collect_known_hashes(self) -> Set[str]:
-        try:
-            hashes = collect_content_hashes_from_db(self._mongo_client, self._db_name)
-            self.known_hashes = hashes or set()
-            logger.debug("collect_known_hashes(): collected %d hashes", len(self.known_hashes))
-            return self.known_hashes
-        except Exception:
-            logger.exception("Failed to collect known hashes from DB")
-            return set()
-
-    def crawl_domain(self, domain_cfg: Dict[str, Any]) -> None:
-        coll_name = domain_cfg.get("collection_name") or domain_cfg.get("collection") or domain_cfg.get("name")
-        base_url = domain_cfg.get("base_url") or domain_cfg.get("url")
-        if not coll_name or not base_url:
-            logger.error("Invalid domain configuration: %s", domain_cfg)
-            return
-
-        if not self._mongo_client:
-            logger.error("No mongo client available")
-            return
-
-        db = self._mongo_client[self._db_name]
-        coll = db[coll_name]
-
-        taz = TAZ(base_url, known_hashes=self.known_hashes)
-        urls = taz.fetch_article_urls()
-        logger.info("Starting crawl for collection %s, found %d urls", coll_name, len(urls))
-
-        for url in urls:
-            try:
-                obj = taz.parse_article_to_object(url)
-                if not obj or not isinstance(obj, ObjectModel):
-                    logger.warning("Parsed object invalid for %s", url)
-                    continue
-
-                # Skip storing obviously empty results to avoid placeholder documents in DB
-                html_val = (getattr(obj, "html", "") or "").strip()
-                text_val = (getattr(obj, "text", "") or "").strip()
-                if not html_val and not text_val:
-                    logger.warning("Skipping storage for %s: parsed html/text empty", url)
-                    continue
-
-                # Prepare document for DB: avoid bringing an _id field
-                if hasattr(obj, "to_dict"):
-                    doc = obj.to_dict()
-                else:
-                    doc = obj.__dict__.copy()
-                doc.pop("_id", None)
-
-                # Use content_hash as canonical key if available, otherwise fallback to url
-                query = {"content_hash": getattr(obj, "content_hash", None)} if getattr(obj, "content_hash", None) else {"url": getattr(obj, "id", getattr(obj, "url", url))}
-
-                # Upsert via update_one($set) to avoid inserting conflicting/immutable _id
-                try:
-                    coll.update_one(query, {"$set": doc}, upsert=True)
-                    logger.info("Stored/updated article %s", url)
-                except DuplicateKeyError:
-                    logger.warning("DuplicateKeyError on update_one for %s; retrying with url key", url)
-                    fallback_query = {"url": getattr(obj, "id", getattr(obj, "url", url))}
-                    coll.update_one(fallback_query, {"$set": doc}, upsert=True)
-                    logger.info("Stored/updated article (fallback) %s", url)
-                except WriteError:
-                    logger.exception("WriteError when storing article %s", url)
-
-            except Exception:
-                logger.exception("Failed to process article %s", url)
-
-    def close(self) -> None:
-        try:
-            if self._mongo_client:
-                self._mongo_client.close()
-        except Exception:
-            logger.exception("Error closing mongo client")
 
 
-def main():
-    mongo_uri = "mongodb://localhost:27017"
-    db_name = "german_news_papaer"
-    domain_cfgs: List[Dict[str, Any]] = [
-        {"name": "taz", "base_url": "https://taz.de/"},
-    ]
+def main() -> None:
+    """
+    Main entrypoint for the crawler script.
+    Expects a valid configuration containing `domains` and a filled `mongodb` section
+    (including a full `uri` and `database` name). If required config entries are
+    missing the script will exit and log an error.
+    """
+    cfg = load_config()
+    if not isinstance(cfg, dict) or "domains" not in cfg:
+        logger.error("Configuration is missing or does not contain the `domains` key in configs/config.yaml")
+        return
 
-    crawler = GermanNewspaperCrawler(mongo_uri, db_name)
+    domains = cfg.get("domains")
+    # comment: ensure domains is a non-empty list
+    if not isinstance(domains, list) or not domains:
+        logger.error("Configuration value `domains` is missing, not a valid array, or empty")
+        return
+
+    mcfg = load_mongodb_config()
+    # strict: require a complete MongoDB URI and a database name in mongodb config
+    if not mcfg.uri:
+        logger.error("MongoDB URI is missing in configuration (`mongodb.uri`)")
+        return
+    if not mcfg.database_name:
+        logger.error("MongoDB database name is missing in configuration (`mongodb.database` / `database_name` / `db`)")
+        return
+
+    db_name = mcfg.database_name
+
+    mongo_client: Optional[MongoClient] = None
     try:
-        crawler.collect_known_hashes()
-        for domain in domain_cfgs:
+        # comment: create MongoClient from the provided URI; fail fast on error
+        try:
+            mongo_client = MongoClient(mcfg.uri)
+        except Exception:
+            logger.exception("Error creating MongoClient from the configured URI")
+            return
+
+        known_hashes: Set[str] = set()
+        try:
+            known = collect_known_hashes(mongo_client, db_name) or set()
+            known_hashes = known
+            logger.info("main(): collected %d known hashes", len(known_hashes))
+        except Exception:
+            logger.exception("main(): failed to collect known hashes, continuing with empty set")
+            known_hashes = set()
+
+        for domain in domains:
             try:
                 logger.info("main(): Starting crawl for domain %s", domain.get("name"))
-                crawler.crawl_domain(domain)
+                updated = process_domain_generic(
+                    domain_cfg=domain,
+                    parser_factory=TAZ,
+                    get_collection_for_domain=get_collection_for_domain,
+                    refresh_known_hashes_for_collection=refresh_known_hashes_for_collection,
+                    upsert_article=upsert_article,
+                    ensure_indexes_for_collections=ensure_indexes_for_collections,
+                    mongo_client=mongo_client,
+                    db_name=db_name,
+                    known_hashes=known_hashes,
+                )
+                if updated is not None:
+                    known_hashes = updated
             except Exception:
                 logger.exception("main(): Error crawling domain %s", domain.get("name"))
     finally:
-        crawler.close()
+        try:
+            close_mongo_client(mongo_client)
+        except Exception:
+            logger.exception("main(): failed to close mongo client")
 
 
 if __name__ == "__main__":
