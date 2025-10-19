@@ -1,74 +1,116 @@
 # python
 from __future__ import annotations
 import logging
+import logging.handlers
 import os
 import sys
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
-_LEVELS: Dict[str, int] = {
-    "DEBUG": logging.DEBUG,
-    "INFO": logging.INFO,
-    "WARNING": logging.WARNING,
-    "ERROR": logging.ERROR,
-    "CRITICAL": logging.CRITICAL,
-    "SILENT": 100,
-}
-logging.addLevelName(_LEVELS["SILENT"], "SILENT")
+from lib.common.config_handler import load_config
+
+_FMT = "%(asctime)s | %(levelname)s | %(name)s:%(lineno)d | %(message)s"
+_FORMATTER = logging.Formatter(_FMT)
+
+_configured = False
 
 
-def setup_logging(level: str = "INFO") -> None:
-    """
-    Robustes Logging-Setup:
-    - erzeugt Datei-Handler (DEBUG) falls möglich
-    - erzeugt Console-Handler (StreamHandler -> stderr) mit dem gewünschten Level
-    - entfernt nur bestehende StreamHandler, um Duplikate zu vermeiden
-    - sorgt dafür, dass bei Fehlern die Konsole trotzdem Logging erhält
-    """
-    lvl_name = (level or "INFO").upper()
-    numeric_level = _LEVELS.get(lvl_name, logging.INFO)
+def _parse_level(level: Optional[str]) -> Optional[int]:
+    if not level:
+        return logging.INFO
+    lvl = str(level).strip().upper()
+    if lvl in ("SILENT", "SILTENT"):
+        return None
+    try:
+        return getattr(logging, lvl)
+    except Exception:
+        return logging.INFO
 
-    root = logging.getLogger()
-    # Deaktiviere globale Deaktivierung und setze vorab Root-Level so, dass Handler alles bekommen kann
-    logging.disable(logging.NOTSET)
-    root.setLevel(logging.DEBUG)
 
-    # Entferne nur vorhandene StreamHandler (vermeidet Entfernen von z.B. file handlers hinzugefügt vom System)
+def _ensure_logdir(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except Exception:
+        return None
+
+
+def _remove_stream_handlers(root: logging.Logger) -> None:
     for h in list(root.handlers):
         if isinstance(h, logging.StreamHandler):
-            root.removeHandler(h)
-
-    # Sicherstellen, dass logs-Verzeichnis existiert
-    logs_dir = os.path.join(os.getcwd(), "logs")
-    try:
-        os.makedirs(logs_dir, exist_ok=True)
-    except Exception:
-        # Falls Verzeichnis nicht erstellt werden kann, Ausgabe auf stderr, Console-Handler später sorgt für Logs
-        print(f"Could not create logs directory {logs_dir}", file=sys.stderr)
-
-    log_file_path = os.path.join(logs_dir, "german_newspapaer_crawler.log")
-    fmt = "%(asctime)s | %(levelname)s | %(filename)s:%(lineno)d | %(funcName)s(): %(message)s"
-    formatter = logging.Formatter(fmt)
-
-    # Datei-Handler versuchen (DEBUG)
-    try:
-        file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        file_handler.setLevel(logging.DEBUG)
-        root.addHandler(file_handler)
-    except Exception as e:
-        # sichtbar machen, damit man weiss warum die Datei-Logs fehlen
-        print(f"Failed to create file log handler at {log_file_path}: {e}", file=sys.stderr)
-
-    # SILENT: keine Console-Ausgabe, Datei-Handler bleibt falls verfügbar
-    if lvl_name == "SILENT":
-        return
-
-    # Console-Handler immer hinzufügen (explizit stderr)
-    console = logging.StreamHandler(stream=sys.stderr)
-    console.setFormatter(formatter)
-    console.setLevel(numeric_level)
-    root.addHandler(console)
+            try:
+                root.removeHandler(h)
+            except Exception:
+                pass
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:
+    """
+    Zentraler Logger-Fabrik. Liest `logging.level` und `logging.logdir` aus der Config.
+    Wenn level == 'SILENT' (oder 'SILTENT') wird kein StreamHandler angelegt.
+    """
+    global _configured
+    cfg = load_config() or {}
+    logging_cfg: Dict[str, Any] = cfg.get("logging", {}) if isinstance(cfg, dict) else {}
+
+    raw_level = logging_cfg.get("level")
+    console_level = _parse_level(raw_level)  # None => SILENT (keine Console)
+    file_level_raw = logging_cfg.get("file_level", "DEBUG")
+    try:
+        file_level = _parse_level(file_level_raw) or logging.DEBUG
+    except Exception:
+        file_level = logging.DEBUG
+
+    # determine logdir: prefer config.logdir, fallback to ./logs
+    cfg_logdir = logging_cfg.get("logdir")
+    default_logdir = os.path.join(os.getcwd(), "logs")
+    logdir = cfg_logdir or default_logdir
+    logdir_real = _ensure_logdir(logdir) or default_logdir
+
+    root = logging.getLogger()
+    if not _configured:
+        # remove all handlers to avoid duplicates; keep only file handlers if SILENT later
+        root.setLevel(logging.DEBUG)  # allow handlers to filter
+        # add rotating file handler (always)
+        try:
+            logfile = os.path.join(logdir_real, "german_newspapaer_crawler.log")
+            fh = logging.handlers.RotatingFileHandler(
+                logfile, maxBytes=10_485_760, backupCount=5, encoding="utf-8"
+            )
+            fh.setFormatter(_FORMATTER)
+            fh.setLevel(file_level)
+            root.addHandler(fh)
+        except Exception as e:
+            print(f"Failed to create file log handler at {logdir_real}: {e}", file=sys.stderr)
+
+        # add console handler only if not SILENT
+        if console_level is not None:
+            ch = logging.StreamHandler(sys.stderr)
+            ch.setFormatter(_FORMATTER)
+            ch.setLevel(console_level)
+            root.addHandler(ch)
+
+        _configured = True
+    else:
+        # Already configured: ensure console handlers match current config.
+        if console_level is None:
+            _remove_stream_handlers(root)
+        else:
+            # ensure at least one StreamHandler with correct level/formatter exists
+            has_console = any(isinstance(h, logging.StreamHandler) for h in root.handlers)
+            if not has_console:
+                ch = logging.StreamHandler(sys.stderr)
+                ch.setFormatter(_FORMATTER)
+                ch.setLevel(console_level)
+                root.addHandler(ch)
+            else:
+                for h in root.handlers:
+                    if isinstance(h, logging.StreamHandler):
+                        try:
+                            h.setFormatter(_FORMATTER)
+                            h.setLevel(console_level)
+                        except Exception:
+                            pass
+
     return logging.getLogger(name)
