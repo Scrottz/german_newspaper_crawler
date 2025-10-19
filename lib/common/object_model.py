@@ -1,5 +1,3 @@
-# python
-# File: lib/common/object_model.py
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Optional, Any, Dict, List, Tuple
