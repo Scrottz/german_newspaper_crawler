@@ -95,7 +95,7 @@ def main() -> None:
                         logger.exception("ensure_indexes_wrapper: failed to ensure indexes for domain %s", domain.get("name"))
 
                 # Build the list of article URLs using the centralized helper
-                article_urls = build_article_urls(domain)
+                article_urls = build_article_urls(domain, known_hashes=known_hashes)
 
                 updated = process_domain_generic(
                     domain_cfg=domain,
