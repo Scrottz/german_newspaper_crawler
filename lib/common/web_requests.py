@@ -1,4 +1,3 @@
-# python
 from __future__ import annotations
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 import re
@@ -127,7 +126,11 @@ def process_domain_generic(
 
     for url in urls:
         logger.debug("process_domain_generic: fetching article %s", url)
-        html = fetch_url(url, timeout=timeout, headers=headers)
+        try:
+            html = fetch_url(url, timeout=timeout, headers=headers)
+        except Exception:
+            logger.exception("process_domain_generic: fetch failed for %s", url)
+            html = ""
 
         # If parse function present: support flexible signatures
         if parse_fn is not None:
@@ -135,6 +138,9 @@ def process_domain_generic(
                 parsed_result = parse_fn(url, html)
             except TypeError:
                 parsed_result = parse_fn(url)
+            except Exception:
+                logger.exception("process_domain_generic: parse_fn raised for %s", url)
+                parsed_result = None
         else:
             parsed_result = None  # _coerce_to_objectmodel will build a minimal ObjectModel from html
 
@@ -143,30 +149,51 @@ def process_domain_generic(
 
         obj = _coerce_to_objectmodel(parsed_result, url, html)
 
-        # ensure a deterministic content_hash exists before checking known_hashes
+        # robust content_hash calculation and comparison against known_hashes
         try:
-            if not getattr(obj, "content_hash", None):
-                # prefer url-based hash for http(s) URLs, fallback to text/html
-                u = getattr(obj, "url", None)
-                if isinstance(u, str) and u.startswith(("http://", "https://")):
+            # compute candidates
+            u = getattr(obj, "url", None)
+            data = (getattr(obj, "text", "") or getattr(obj, "html", "") or "").strip()
+
+            url_hash: Optional[str] = None
+            content_hash_calc: Optional[str] = None
+
+            if isinstance(u, str) and u.startswith(("http://", "https://")):
+                try:
                     h = hashlib.sha256()
                     h.update(u.encode("utf-8"))
-                    obj.content_hash = h.hexdigest()
-                    logger.debug("process_domain_generic: computed content_hash from url for %s", url)
-                else:
-                    data = (getattr(obj, "text", "") or getattr(obj, "html", "") or "").strip()
-                    if data:
-                        h = hashlib.sha256()
-                        h.update(data.encode("utf-8"))
-                        obj.content_hash = h.hexdigest()
-                        logger.debug("process_domain_generic: computed content_hash from content for %s", url)
-        except Exception:
-            logger.exception("process_domain_generic: failed to compute content_hash for %s", url)
+                    url_hash = h.hexdigest()
+                except Exception:
+                    logger.exception("process_domain_generic: failed computing url_hash for %s", u)
 
-        # skip known content BEFORE any expensive processing (pos_tagging)
-        if getattr(obj, "content_hash", None) and obj.content_hash in known_hashes:
-            logger.debug("process_domain_generic: skipping known content %s (hash=%s)", url, obj.content_hash)
-            continue
+            if data:
+                try:
+                    h2 = hashlib.sha256()
+                    h2.update(data.encode("utf-8"))
+                    content_hash_calc = h2.hexdigest()
+                except Exception:
+                    logger.exception("process_domain_generic: failed computing content_hash from data for %s", url)
+
+            # If obj already has content_hash keep it; otherwise prefer content hash, fallback to url hash
+            if not getattr(obj, "content_hash", None):
+                obj.content_hash = content_hash_calc or url_hash
+
+            # Check known_hashes against all variants
+            if obj.content_hash and obj.content_hash in known_hashes:
+                logger.debug("process_domain_generic: skipping known content %s (hash=%s)", url, obj.content_hash)
+                continue
+
+            if url_hash and url_hash in known_hashes:
+                obj.content_hash = url_hash
+                logger.debug("process_domain_generic: skipping known content (url-hash) %s (hash=%s)", url, url_hash)
+                continue
+
+            if content_hash_calc and content_hash_calc in known_hashes:
+                obj.content_hash = content_hash_calc
+                logger.debug("process_domain_generic: skipping known content (content-hash) %s (hash=%s)", url, content_hash_calc)
+                continue
+        except Exception:
+            logger.exception("process_domain_generic: failed to compute or compare content_hash for %s", url)
 
         # only call pos_tag_fn if the article is not skipped
         if pos_tag_fn is not None:
@@ -176,17 +203,28 @@ def process_domain_generic(
                 logger.exception("process_domain_generic: pos_tag_fn failed for %s", url)
 
         # Re-check known hashes in case pos_tag_fn or other steps modified content_hash
-        if getattr(obj, "content_hash", None) and obj.content_hash in known_hashes:
-            logger.debug("process_domain_generic: skipping known content after tagging %s", obj.content_hash)
-            continue
+        try:
+            if getattr(obj, "content_hash", None) and obj.content_hash in known_hashes:
+                logger.debug("process_domain_generic: skipping known content after tagging %s", obj.content_hash)
+                continue
+        except Exception:
+            logger.exception("process_domain_generic: re-check of content_hash failed for %s", url)
 
-        upsert_article(mongo_client, db_name, collection_name, obj)
+        # upsert and register new hash
+        try:
+            upsert_article(mongo_client, db_name, collection_name, obj)
+        except Exception:
+            logger.exception("process_domain_generic: upsert_article failed for %s", url)
         if obj.content_hash:
             known_hashes.add(obj.content_hash)
         logger.info("process_domain_generic: upserted article _id=%s url=%s", getattr(obj, "_id", None), obj.url)
 
     if refresh_known_hashes_for_collection is not None:
-        return refresh_known_hashes_for_collection(mongo_client, db_name, collection_name)
+        try:
+            return refresh_known_hashes_for_collection(mongo_client, db_name, collection_name)
+        except Exception:
+            logger.exception("process_domain_generic: refresh_known_hashes_for_collection failed for %s", collection_name)
+            return known_hashes
 
     return known_hashes
 
@@ -205,23 +243,42 @@ def extract_collection_name(result: Any, domain_cfg: Dict[str, Any]) -> Optional
     return domain_cfg.get("collection") or domain_cfg.get("name")
 
 
-def build_article_urls(domain_cfg: Dict[str, Any]) -> List[str]:
+def build_article_urls(domain_cfg: Dict[str, Any], known_hashes: Optional[Set[str]] = None) -> List[str]:
     """
     Load a domain module and call its get_article_urls function.
     If the module exports a callable 'parse_article', attach it to domain_cfg['parse_article'].
+    Pass `known_hashes` into the domain config so domain-specific fetchers (z.B. TAZ)
+    can skip known urls already during link-collection.
     Returns a list (possibly empty) of article URLs.
     """
     module_name = domain_cfg.get("module") or f"lib.domain.{domain_cfg.get('name')}"
+
+    # work on a shallow copy to avoid mutating caller's dict
+    cfg_for_module = dict(domain_cfg)
+    if known_hashes is not None:
+        # pass a copy into the module
+        cfg_for_module["known_hashes"] = set(known_hashes)
+        # also try to expose known_hashes on the original domain_cfg so other parts can see it
+        try:
+            domain_cfg["known_hashes"] = set(known_hashes)
+        except Exception:
+            logger.debug("build_article_urls: could not set known_hashes on original domain_cfg")
+
     try:
         mod = importlib.import_module(module_name)
     except Exception:
         logger.exception("Failed to import domain module %s; returning empty url list", module_name)
         return []
 
-    # If the module exposes a parse_article callable, attach it to the domain config
+    # If the module exposes a parse_article callable, attach it to both the domain config copy
+    # and the original domain_cfg so process_domain_generic can make use of it later.
     parse_fn = getattr(mod, "parse_article", None)
     if callable(parse_fn):
-        domain_cfg["parse_article"] = parse_fn
+        cfg_for_module["parse_article"] = parse_fn
+        try:
+            domain_cfg["parse_article"] = parse_fn
+        except Exception:
+            logger.exception("Failed to attach parse_article to domain_cfg for module %s", module_name)
 
     fn = getattr(mod, "get_article_urls", None)
     if not callable(fn):
@@ -229,7 +286,8 @@ def build_article_urls(domain_cfg: Dict[str, Any]) -> List[str]:
         return []
 
     try:
-        urls_iter = fn(domain_cfg)
+        # prefer calling with domain_cfg copy so domain modules can read known_hashes
+        urls_iter = fn(cfg_for_module)
     except TypeError:
         try:
             urls_iter = fn()
