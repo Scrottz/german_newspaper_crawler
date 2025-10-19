@@ -1,99 +1,101 @@
 from __future__ import annotations
-import os
-from typing import Any, Dict, Optional, Set, List
 from dataclasses import dataclass
-
+from typing import Any, Dict, Optional
+import os
+import logging
 import yaml
 
+logger = logging.getLogger(__name__)
 
-def get_config_path() -> str:
-    """Return absolute path to `configs/config.yaml` relative to project root."""
-    package_dir = os.path.dirname(__file__)  # e.g. .../lib/common
-    project_root = os.path.abspath(os.path.join(package_dir, os.pardir, os.pardir))
-    return os.path.join(project_root, "configs", "config.yaml")
-
-
-def load_config(path: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Load YAML config from the given path (or from the default config path).
-    Returns a dict; on error returns an empty dict.
-    """
-    cfg_path = path or get_config_path()
-    try:
-        with open(cfg_path, "r", encoding="utf-8") as fh:
-            return yaml.safe_load(fh) or {}
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        return {}
+_CACHED_CONFIG: Optional[Dict[str, Any]] = None
+_CACHED_CONFIG_PATH: Optional[str] = None
 
 
 @dataclass
-class MongoDBConfig:
-    """Lightweight container for MongoDB connection settings from config."""
-    uri: Optional[str] = None
-    host: Optional[str] = None
-    port: Optional[int] = None
-    username: Optional[str] = None
-    password: Optional[str] = None
-    auth_source: Optional[str] = None
-    replica_set: Optional[str] = None
-    database_name: Optional[str] = None
+class MongoConfig:
+    uri: Optional[str]
+    database_name: Optional[str]
 
 
-def load_mongodb_config(path: Optional[str] = None) -> MongoDBConfig:
+def _default_config_path() -> str:
     """
-    Load mongodb configuration from the YAML config.
-    Looks under top-level key 'mongodb' and returns a MongoDBConfig instance.
+    Return the default configuration path (project root / configs / config.yaml)
+    calculated relative to this file.
+    """
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    return os.path.join(project_root, "configs", "config.yaml")
+
+
+def load_config(path: Optional[str] = None, force_reload: bool = False) -> Dict[str, Any]:
+    """
+    Load YAML configuration and return the raw mapping parsed by PyYAML.
+
+    Caches the last loaded file (by path) unless `force_reload=True` is given.
+    Returns an empty dict on error or when top-level object is not a mapping.
+    """
+    global _CACHED_CONFIG, _CACHED_CONFIG_PATH
+
+    cfg_path = path or _default_config_path()
+
+    # Return cached when available for the same path
+    if not force_reload and _CACHED_CONFIG is not None and _CACHED_CONFIG_PATH == cfg_path:
+        return _CACHED_CONFIG
+
+    if not os.path.exists(cfg_path):
+        logger.error("Configuration file not found at %s", cfg_path)
+        _CACHED_CONFIG = {}
+        _CACHED_CONFIG_PATH = cfg_path
+        return {}
+
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh)
+    except Exception:
+        logger.exception("Failed to read/parse configuration file %s", cfg_path)
+        _CACHED_CONFIG = {}
+        _CACHED_CONFIG_PATH = cfg_path
+        return {}
+
+    if raw is None:
+        raw = {}
+
+    if not isinstance(raw, dict):
+        logger.error("Top-level configuration is not a mapping/dict in %s", cfg_path)
+        _CACHED_CONFIG = {}
+        _CACHED_CONFIG_PATH = cfg_path
+        return {}
+
+    logger.info("Configuration loaded from %s", cfg_path)
+    _CACHED_CONFIG = raw
+    _CACHED_CONFIG_PATH = cfg_path
+    return raw
+
+
+def load_mongodb_config(path: Optional[str] = None) -> MongoConfig:
+    """
+    Read the 'mongodb' section from the raw configuration and return a MongoConfig.
+
+    Minimal processing: looks up common keys and falls back to environment variables.
+    Does not raise; returns None fields when not found.
     """
     cfg = load_config(path)
-    mcfg = cfg.get("mongodb", {}) if isinstance(cfg, dict) else {}
-    # support both nested and flat representations
-    uri = mcfg.get("uri") or mcfg.get("url")
-    host = mcfg.get("host")
-    port = None
-    if mcfg.get("port") is not None:
-        try:
-            port = int(mcfg.get("port"))
-        except Exception:
-            port = None
-    username = mcfg.get("username") or mcfg.get("user")
-    password = mcfg.get("password") or mcfg.get("pass")
-    auth_source = mcfg.get("auth_source") or mcfg.get("authSource")
-    replica_set = mcfg.get("replica_set") or mcfg.get("replicaSet")
-    database_name = mcfg.get("database") or mcfg.get("database_name") or mcfg.get("db")
-    return MongoDBConfig(
-        uri=uri,
-        host=host,
-        port=port,
-        username=username,
-        password=password,
-        auth_source=auth_source,
-        replica_set=replica_set,
-        database_name=database_name,
+    mdb = cfg.get("mongodb") if isinstance(cfg, dict) else None
+
+    if not isinstance(mdb, dict):
+        logger.warning("No valid 'mongodb' mapping found in configuration")
+        return MongoConfig(uri=None, database_name=None)
+
+    uri = mdb.get("uri") or mdb.get("connection_string") or os.environ.get("MONGODB_URI")
+    dbname = (
+        mdb.get("database_name")
+        or mdb.get("database")
+        or mdb.get("db")
+        or os.environ.get("MONGODB_DATABASE")
     )
 
+    if not uri:
+        logger.debug("MongoDB URI not present in config or environment")
+    if not dbname:
+        logger.debug("MongoDB database name not present in config or environment")
 
-def get_domain_collection_name(domain_cfg: Optional[Dict[str, Any]]) -> Optional[str]:
-    """
-    Return a collection name for a domain configuration.
-    Accepts common keys: 'collection', 'collection_name', 'collectionName'.
-    """
-    if not domain_cfg or not isinstance(domain_cfg, dict):
-        return None
-    for key in ("collection", "collection_name", "collectionName", "collection-name"):
-        val = domain_cfg.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    return None
-
-
-def main() -> int:
-    """Small CLI: load config and print top-level keys when executed directly."""
-    cfg = load_config()
-    print("Loaded config keys:", list(cfg.keys()))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    return MongoConfig(uri=uri, database_name=dbname)
