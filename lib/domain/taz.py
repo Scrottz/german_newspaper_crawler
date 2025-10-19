@@ -1,17 +1,17 @@
 # python
 from __future__ import annotations
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple, Callable, Any
 from urllib.parse import urljoin
 import json
 import re
 from datetime import datetime
 import hashlib
 
-import requests
 from bs4 import BeautifulSoup
 
 from lib.common.logging import get_logger
 from lib.common.object_model import ObjectModel
+from lib.common.web_requests import get_html
 
 logger = get_logger(__name__)
 
@@ -51,7 +51,6 @@ def _extract_meta_from_soup(soup: BeautifulSoup) -> Tuple[Optional[str], Optiona
 
     # category detection (TAZ styling heuristics)
     def _has_category_classes(c):
-        # Accept string or list/tuple of classes, normalize to set of tokens
         if not c:
             return False
         if isinstance(c, str):
@@ -140,7 +139,6 @@ def _extract_meta_from_soup(soup: BeautifulSoup) -> Tuple[Optional[str], Optiona
         )
         if author_container:
             logger.debug("Found author container, applying TAZ heuristics")
-            # try image alt/title
             img = author_container.find("img")
             if img:
                 alt = (img.get("alt") or img.get("title") or "").strip()
@@ -148,7 +146,6 @@ def _extract_meta_from_soup(soup: BeautifulSoup) -> Tuple[Optional[str], Optiona
                     author = re.sub(r"\s+", " ", alt).strip()
                     logger.debug("Author from image alt/title: %s", author)
 
-            # strong candidate: span.typo-name-detail-bold
             if not author:
                 for span in author_container.find_all("span"):
                     classes = span.get("class") or []
@@ -160,7 +157,6 @@ def _extract_meta_from_soup(soup: BeautifulSoup) -> Tuple[Optional[str], Optiona
                             logger.debug("Author from strong span candidate: %s", author)
                             break
 
-            # textual pattern 'von' followed by link or span
             if not author:
                 texts = author_container.find_all(text=True)
                 for i, t in enumerate(texts):
@@ -174,7 +170,6 @@ def _extract_meta_from_soup(soup: BeautifulSoup) -> Tuple[Optional[str], Optiona
                                 logger.debug("Author found after 'von' token: %s", author)
                                 break
 
-            # fallback: first meaningful <a> inside container
             if not author:
                 a_tag = author_container.find("a", href=True)
                 if a_tag:
@@ -208,23 +203,30 @@ class TAZ:
 
     Provides methods to collect article URLs and to parse article text.
     Accepts an optional `known_hashes` set so already-seen articles can be skipped.
+    A `fetcher` callable can be injected for HTTP access (default: lib.common.web_requests.get_html).
     """
-    def __init__(self, base_url: str, known_hashes: Optional[Set[str]] = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        known_hashes: Optional[Set[str]] = None,
+        fetcher: Optional[Callable[..., str]] = None,
+    ) -> None:
         self.base_url = base_url
         # allow injection via constructor or later via setattr(instance, "known_hashes", set)
         self.known_hashes: Set[str] = known_hashes or set()
+        # fetcher should return HTML string given a URL; allow flexible signature
+        self.fetcher: Callable[..., str] = fetcher or get_html
         logger.debug("TAZ initialized for base_url=%s known_hashes=%d", self.base_url, len(self.known_hashes))
 
     def fetch_article_urls(self, html: Optional[str] = None) -> List[str]:
         """
         Fetch the base page and return a list of absolute article URLs found as 'a.teaser-link'.
+        Uses injected fetcher to retrieve HTML.
         """
         try:
             if html is None:
                 logger.debug("Fetching base URL: %s", self.base_url)
-                resp = requests.get(self.base_url, timeout=10)
-                resp.raise_for_status()
-                html = resp.text
+                html = self.fetcher(self.base_url)
 
             soup = BeautifulSoup(html, "html.parser")
             anchors = soup.find_all("a", class_="teaser-link")
@@ -300,9 +302,7 @@ class TAZ:
             # proceed to fetch and parse
             if html is None:
                 logger.debug("Fetching article URL for parsing: %s", url)
-                resp = requests.get(url, timeout=10)
-                resp.raise_for_status()
-                html = resp.text
+                html = self.fetcher(url)
 
             soup = BeautifulSoup(html, "html.parser")
 
@@ -438,13 +438,11 @@ class TAZ:
                 category=category,
                 content_hash=url_hash,
             )
-
             logger.info("Created ObjectModel for %s (text length: %d)", url, len(text))
             return obj
 
         except Exception:
             logger.exception("Failed to parse article content from %s", url)
-            # return an empty/placeholder ObjectModel on error (include url-based hash if available)
             try:
                 h2 = hashlib.sha256()
                 h2.update(url.encode("utf-8"))
