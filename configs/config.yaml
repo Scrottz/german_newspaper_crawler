@@ -3,7 +3,7 @@
 # Logging configuration
 # ---------------------------------------------------------------------------
 logging:
-  level: "SILENT"
+  level: "DEBUG"
   logdir: "logs"
   retentions_day: 14
 
@@ -11,28 +11,23 @@ logging:
 # Domains configuration
 # ---------------------------------------------------------------------------
 domains:
-  taz:
-    mongodb_collection_name: "taz"
+  - name: taz
+    collection: "taz"
     class_path: "lib.domain.taz:TAZ"
-    base_urls:
-      - "https://taz.de/"
+    base_url: "https://taz.de/"
 
 # ---------------------------------------------------------------------------
 # MongoDB configuration
 # ---------------------------------------------------------------------------
 mongodb:
-  database_name: "german_news_papaer"
+  uri: "mongodb://localhost:27017"    # replace with credentials/host if required
+  database_name: "german_news_paper"
 
-
-downloads:
+# ---------------------------------------------------------------------------
+# Scheduler configuration
+# ---------------------------------------------------------------------------
+scheduler:
   enabled: true
-  dest_dir: "data/downloads"
-  workers: 8
-
-  scheduler:
-    enabled: true
-    time: "01:00"
-    timezone: "Europe/Berlin"
-
-
+  time: "01:00"
+  timezone: "Europe/Berlin"
 
